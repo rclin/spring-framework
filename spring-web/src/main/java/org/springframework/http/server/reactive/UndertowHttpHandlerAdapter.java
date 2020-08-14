@@ -1,11 +1,11 @@
 /*
- * Copyright 2002-2016 the original author or authors.
+ * Copyright 2002-2020 the original author or authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ *      https://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -16,14 +16,18 @@
 
 package org.springframework.http.server.reactive;
 
-import java.util.Map;
+import java.io.IOException;
+import java.net.URISyntaxException;
 
 import io.undertow.server.HttpServerExchange;
+import org.apache.commons.logging.Log;
 import org.reactivestreams.Subscriber;
 import org.reactivestreams.Subscription;
 
 import org.springframework.core.io.buffer.DataBufferFactory;
 import org.springframework.core.io.buffer.DefaultDataBufferFactory;
+import org.springframework.http.HttpLogging;
+import org.springframework.http.HttpMethod;
 import org.springframework.util.Assert;
 
 /**
@@ -34,56 +38,102 @@ import org.springframework.util.Assert;
  * @author Arjen Poutsma
  * @since 5.0
  */
-public class UndertowHttpHandlerAdapter extends HttpHandlerAdapterSupport
-		implements io.undertow.server.HttpHandler {
+public class UndertowHttpHandlerAdapter implements io.undertow.server.HttpHandler {
 
-	private DataBufferFactory dataBufferFactory = new DefaultDataBufferFactory(false);
+	private static final Log logger = HttpLogging.forLogName(UndertowHttpHandlerAdapter.class);
+
+
+	private final HttpHandler httpHandler;
+
+	private DataBufferFactory bufferFactory = DefaultDataBufferFactory.sharedInstance;
 
 
 	public UndertowHttpHandlerAdapter(HttpHandler httpHandler) {
-		super(httpHandler);
-	}
-
-	public UndertowHttpHandlerAdapter(Map<String, HttpHandler> handlerMap) {
-		super(handlerMap);
+		Assert.notNull(httpHandler, "HttpHandler must not be null");
+		this.httpHandler = httpHandler;
 	}
 
 
-	public void setDataBufferFactory(DataBufferFactory dataBufferFactory) {
-		Assert.notNull(dataBufferFactory, "DataBufferFactory must not be null");
-		this.dataBufferFactory = dataBufferFactory;
+	public void setDataBufferFactory(DataBufferFactory bufferFactory) {
+		Assert.notNull(bufferFactory, "DataBufferFactory must not be null");
+		this.bufferFactory = bufferFactory;
+	}
+
+	public DataBufferFactory getDataBufferFactory() {
+		return this.bufferFactory;
 	}
 
 
 	@Override
-	public void handleRequest(HttpServerExchange exchange) throws Exception {
-
-		ServerHttpRequest request = new UndertowServerHttpRequest(exchange, this.dataBufferFactory);
-		ServerHttpResponse response = new UndertowServerHttpResponse(exchange, this.dataBufferFactory);
-
-		getHttpHandler().handle(request, response).subscribe(new Subscriber<Void>() {
-			@Override
-			public void onSubscribe(Subscription subscription) {
-				subscription.request(Long.MAX_VALUE);
+	public void handleRequest(HttpServerExchange exchange) {
+		UndertowServerHttpRequest request = null;
+		try {
+			request = new UndertowServerHttpRequest(exchange, getDataBufferFactory());
+		}
+		catch (URISyntaxException ex) {
+			if (logger.isWarnEnabled()) {
+				logger.debug("Failed to get request URI: " + ex.getMessage());
 			}
-			@Override
-			public void onNext(Void aVoid) {
-				// no op
-			}
-			@Override
-			public void onError(Throwable ex) {
-				logger.error("Could not complete request", ex);
-				if (!exchange.isResponseStarted() && exchange.getStatusCode() <= 500) {
-					exchange.setStatusCode(500);
+			exchange.setStatusCode(400);
+			return;
+		}
+		ServerHttpResponse response = new UndertowServerHttpResponse(exchange, getDataBufferFactory(), request);
+
+		if (request.getMethod() == HttpMethod.HEAD) {
+			response = new HttpHeadResponseDecorator(response);
+		}
+
+		HandlerResultSubscriber resultSubscriber = new HandlerResultSubscriber(exchange, request);
+		this.httpHandler.handle(request, response).subscribe(resultSubscriber);
+	}
+
+
+	private class HandlerResultSubscriber implements Subscriber<Void> {
+
+		private final HttpServerExchange exchange;
+
+		private final String logPrefix;
+
+
+		public HandlerResultSubscriber(HttpServerExchange exchange, UndertowServerHttpRequest request) {
+			this.exchange = exchange;
+			this.logPrefix = request.getLogPrefix();
+		}
+
+		@Override
+		public void onSubscribe(Subscription subscription) {
+			subscription.request(Long.MAX_VALUE);
+		}
+
+		@Override
+		public void onNext(Void aVoid) {
+			// no-op
+		}
+
+		@Override
+		public void onError(Throwable ex) {
+			logger.trace(this.logPrefix + "Failed to complete: " + ex.getMessage());
+			if (this.exchange.isResponseStarted()) {
+				try {
+					logger.debug(this.logPrefix + "Closing connection");
+					this.exchange.getConnection().close();
 				}
-				exchange.endExchange();
+				catch (IOException ex2) {
+					// ignore
+				}
 			}
-			@Override
-			public void onComplete() {
-				logger.debug("Successfully completed request");
-				exchange.endExchange();
+			else {
+				logger.debug(this.logPrefix + "Setting HttpServerExchange status to 500 Server Error");
+				this.exchange.setStatusCode(500);
+				this.exchange.endExchange();
 			}
-		});
+		}
+
+		@Override
+		public void onComplete() {
+			logger.trace(this.logPrefix + "Handling completed");
+			this.exchange.endExchange();
+		}
 	}
 
 }
